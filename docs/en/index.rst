@@ -1,4 +1,4 @@
-Welcome to the VLMEvalKit Chinese Tutorial!
+Welcome to the VLMEvalKit Tutorial!
 ==========================================
 
 VLMEvalKit Getting Started Guide
