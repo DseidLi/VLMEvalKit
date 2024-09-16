@@ -400,9 +400,22 @@ class LLaVA_OneVision(BaseModel):
             warnings.warn('Please `pip install git+https://github.com/LLaVA-VL/LLaVA-NeXT.git`')
 
         model_name = get_model_name_from_path(model_path)
-        tokenizer, model, image_processor, _ = load_pretrained_model(model_path, None, model_name, device_map=None)
-        model.cuda().eval()
-        model.tie_weights()
+
+        if '72b' not in model_name.lower():
+            # Small model: Load onto CPU first, then move to GPU
+            tokenizer, model, image_processor, _ = load_pretrained_model(
+                model_path, None, model_name, device_map=None
+            )
+            model.cuda().eval()
+            model.tie_weights()
+        else:
+            # Large model: Split across multiple GPUs
+            device_map = self.split_model(model_name)
+            tokenizer, model, image_processor, _ = load_pretrained_model(
+                model_path, None, model_name, device_map=device_map
+            )
+            model.eval()
+            model.tie_weights()
 
         if 'llava' in model_path.lower():
             conv_mode = 'qwen_1_5'
@@ -416,6 +429,58 @@ class LLaVA_OneVision(BaseModel):
         self.image_processor = image_processor
         self.tokenizer_image_token = tokenizer_image_token
         self.process_images = process_images  # Store process_images as a class attribute
+
+    @staticmethod
+    def split_model(model_name):
+        from vlmeval.smp.misc import get_rank_and_world_size
+
+        device_map = {}
+        num_gpus = torch.cuda.device_count()
+        rank, world_size = get_rank_and_world_size()
+        num_gpus_per_process = num_gpus // world_size
+
+        num_layers = 80  # Number of layers in the model architecture
+
+        # GPU capacities (first GPU has less capacity due to Vision Tower)
+        gpu_capacities = [0.8] + [1.0] * (num_gpus_per_process - 1)
+        total_capacity = sum(gpu_capacities)
+
+        # Expected layers per GPU based on capacity
+        expected_layers = [capacity / total_capacity * num_layers for capacity in gpu_capacities]
+        layers_per_gpu = [int(round(layers)) for layers in expected_layers]
+
+        # Adjust to ensure total layers assigned equals num_layers
+        total_assigned_layers = sum(layers_per_gpu)
+        while total_assigned_layers != num_layers:
+            if total_assigned_layers > num_layers:
+                idx = layers_per_gpu.index(max(layers_per_gpu))
+                layers_per_gpu[idx] -= 1
+            else:
+                idx = layers_per_gpu.index(min(layers_per_gpu))
+                layers_per_gpu[idx] += 1
+            total_assigned_layers = sum(layers_per_gpu)
+
+        # Assign layers to devices
+        layer_idx = 0
+        for i, num_layers_on_gpu in enumerate(layers_per_gpu):
+            device_id = rank * num_gpus_per_process + i
+            for _ in range(num_layers_on_gpu):
+                if layer_idx >= num_layers:
+                    break
+                device_map[f'model.layers.{layer_idx}'] = device_id
+                layer_idx += 1
+
+        # Assign other components to the base device
+        base_device = rank * num_gpus_per_process
+        device_map.update({
+            'model.embed_tokens': base_device,
+            'model.norm': base_device,
+            'lm_head': base_device,
+            'model.vision_tower': base_device,
+            'model.mm_projector': base_device,
+        })
+
+        return device_map
 
     def generate_inner_image(self, message, dataset=None):
         content, images = '', []
