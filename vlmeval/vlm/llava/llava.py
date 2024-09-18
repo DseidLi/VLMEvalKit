@@ -478,8 +478,9 @@ class LLaVA_OneVision(BaseModel):
             'lm_head': base_device,
             'model.vision_tower': base_device,
             'model.mm_projector': base_device,
+            'model.image_newline': base_device,
         })
-
+        print(device_map)
         return device_map
 
     def generate_inner_image(self, message, dataset=None):
